@@ -6,6 +6,11 @@ import sys
 
 import bpy
 
+
+def curves(action):
+    # Blender 5 moved F-curves into layered-action channelbags.
+    return action.fcurves if hasattr(action, 'fcurves') else next(b for l in action.layers for s in l.strips for b in s.channelbags).fcurves
+
 # Blender starts with its own Python paths. This entry point only imports the
 # pinned FBX sampler already used by character exports.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -36,7 +41,7 @@ def export(work):
     if fps_base != 1.0:
         # Blender 4.5 imports key times using render.fps alone. Bake at the
         # original frame rate by accounting for fps_base before sampling.
-        for curve in action.fcurves:
+        for curve in curves(action):
             for key in curve.keyframe_points:
                 key.co.x /= fps_base
                 key.handle_left.x /= fps_base

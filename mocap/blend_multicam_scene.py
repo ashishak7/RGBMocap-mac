@@ -5,6 +5,11 @@ import bpy
 import numpy as np
 from mathutils import Matrix,Vector,Quaternion
 
+
+def curves(action):
+    # Blender 5 moved F-curves into layered-action channelbags.
+    return action.fcurves if hasattr(action, 'fcurves') else next(b for l in action.layers for s in l.strips for b in s.channelbags).fcurves
+
 def progress(current,total,message):
     print('@@BLEND@@'+json.dumps(dict(current=current,total=total,message=message)),flush=True)
 
@@ -25,7 +30,7 @@ def visibility(obj,first,end):
         for prop in ('hide_viewport','hide_render'):
             setattr(obj,prop,hide);obj.keyframe_insert(data_path=prop,frame=f)
     if obj.animation_data:
-        for curve in obj.animation_data.action.fcurves:
+        for curve in curves(obj.animation_data.action):
             if curve.data_path in ('hide_viewport','hide_render'):
                 for p in curve.keyframe_points:p.interpolation='CONSTANT'
 for actor_index,a in enumerate(job['actors']):
