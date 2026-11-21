@@ -8,6 +8,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+CONVOLUTIONS = {'conv1d', 'conv2d', 'conv3d', 'conv_transpose1d', 'conv_transpose2d', 'conv_transpose3d'}
+
 
 def available():
     return sys.platform == 'darwin'
@@ -57,6 +59,9 @@ def install():
     cuda.synchronize = lambda device=None: torch.mps.synchronize()
     cuda.reset_peak_memory_stats = lambda device=None: None
     cuda.set_per_process_memory_fraction = lambda fraction, device=None: None
+    cuda.get_per_process_memory_fraction = lambda device=None: 1.0
+    cuda.max_memory_cached = cuda.memory_cached = lambda device=None: int(torch.mps.driver_allocated_memory())
+    cuda.reset_max_memory_allocated = cuda.reset_peak_memory_stats
     cuda.max_memory_allocated = lambda device=None: int(torch.mps.current_allocated_memory())
     cuda.max_memory_reserved = lambda device=None: int(torch.mps.driver_allocated_memory())
     cuda.memory_allocated = lambda device=None: int(torch.mps.current_allocated_memory())
@@ -72,6 +77,10 @@ def install():
     class Redirect(TorchFunctionMode):
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = dict(kwargs or {})
+            if getattr(func, '__name__', '') in CONVOLUTIONS and args and getattr(args[0], 'device', None) is not None \
+                    and args[0].device.type == 'mps' and not args[0].is_contiguous():
+                # MPS convolutions reject strided views such as x[..., 32:-32].
+                args = (args[0].contiguous(),) + tuple(args[1:])
             if func is torch.Tensor.cuda:
                 func, args = torch.Tensor.to, (args[0], mps)
             if _is_cuda(kwargs.get('device')):
@@ -115,8 +124,13 @@ def install():
     original_load = torch.load
 
     def load(*args, **kwargs):
-        location = kwargs.get('map_location')
-        kwargs['map_location'] = 'cpu' if location is None or _is_cuda(location) else location
+        args = list(args)
+        location = args[1] if len(args) > 1 else kwargs.get('map_location')
+        location = 'cpu' if location is None or _is_cuda(location) else location
+        if len(args) > 1:
+            args[1] = location
+        else:
+            kwargs['map_location'] = location
         return original_load(*args, **kwargs)
 
     torch.load = load
