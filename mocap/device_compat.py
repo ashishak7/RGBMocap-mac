@@ -83,11 +83,15 @@ def install():
                 args = (args[0].contiguous(),) + tuple(args[1:])
             if func is torch.Tensor.cuda:
                 func, args = torch.Tensor.to, (args[0], mps)
+            if func is torch.Tensor.double and getattr(args[0], 'device', None) is not None and args[0].device.type == 'mps':
+                func = torch.Tensor.float
             if _is_cuda(kwargs.get('device')):
                 kwargs['device'] = mps
             if func is torch.Tensor.to:
                 args = tuple(fix(a) for a in args)
                 target = kwargs.get('device', next((a for a in args[1:] if isinstance(a, (str, torch.device))), None))
+                if target is None and getattr(args[0], 'device', None) is not None and args[0].device.type == 'mps':
+                    target = 'mps'
                 if target is not None and str(target).startswith('mps'):
                     args = tuple(fix_dtype(a, target) for a in args)
                     kwargs = {k: fix_dtype(v, target) if k == 'dtype' else v for k, v in kwargs.items()}
@@ -126,7 +130,7 @@ def install():
     def load(*args, **kwargs):
         args = list(args)
         location = args[1] if len(args) > 1 else kwargs.get('map_location')
-        location = 'cpu' if location is None or _is_cuda(location) else location
+        location = 'cpu' if location is None or callable(location) or _is_cuda(location) else location
         if len(args) > 1:
             args[1] = location
         else:
@@ -135,6 +139,32 @@ def install():
 
     torch.load = load
 
+    original_jit_load = torch.jit.load
+
+    class CpuScript(torch.nn.Module):
+        # MHR's TorchScript forward needs float64, which MPS lacks: run it on CPU and hand results back.
+        def __init__(self, script):
+            super().__init__()
+            self.script = script
+
+        def _apply(self, fn, recurse=True):
+            return self
+
+        def forward(self, *args, **kwargs):
+            def cpu(v):
+                return v.detach().cpu() if torch.is_tensor(v) else v
+            home = next((a.device for a in list(args) + list(kwargs.values()) if torch.is_tensor(a)), None)
+            out = self.script(*[cpu(a) for a in args], **{k: cpu(v) for k, v in kwargs.items()})
+            if home is None or home.type == 'cpu':
+                return out
+            return tuple(o.to(home) if torch.is_tensor(o) else o for o in out) if isinstance(out, (tuple, list)) else out.to(home)
+
+    def jit_load(f, map_location=None, *args, **kwargs):
+        if map_location is None or _is_cuda(map_location):
+            map_location = 'cpu'
+        return CpuScript(original_jit_load(f, map_location, *args, **kwargs))
+
+    torch.jit.load = jit_load
     original_autocast = torch.autocast.__init__
 
     def autocast_init(self, device_type='cuda', *args, **kwargs):
