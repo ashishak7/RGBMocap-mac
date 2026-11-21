@@ -8,4 +8,10 @@ if [ ! -x "$python" ]; then
 fi
 cd -- "$root" || exit 1
 export PATH="/opt/homebrew/bin:$PATH" PYTORCH_ENABLE_MPS_FALLBACK=1
+# The app targets Blender 4.5 LTS; prefer it, otherwise use whatever is installed.
+if [ -z "${RGBMOCAP_BLENDER:-}" ]; then
+    for app in "$root"/runtime_character/Blender*.app /Applications/Blender*4.5*.app "$HOME"/Applications/Blender*4.5*.app /Applications/Blender.app; do
+        [ -x "$app/Contents/MacOS/Blender" ] && export RGBMOCAP_BLENDER="$app/Contents/MacOS/Blender" && break
+    done
+fi
 exec "$python" -X utf8 app.py "$@"
