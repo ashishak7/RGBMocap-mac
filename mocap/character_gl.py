@@ -2,7 +2,8 @@
 import numpy as np
 from PySide6.QtOpenGL import QOpenGLShader,QOpenGLBuffer,QOpenGLTexture
 from PySide6.QtGui import QImage,QMatrix4x4,QVector4D
-from .mesh_gl import MeshRenderer
+from .mesh_gl import MeshRenderer, COMPUTE, GLSL
+from .cpu_skin import CharacterModel, Topology, records
 
 SKIN='''#version 430 core
 layout(local_size_x=64) in;
@@ -24,11 +25,11 @@ void main(){
  }
  vertices[i].position=vec4(p,1);
 }'''
-VERTEX='''#version 430 core
+VERTEX=GLSL+'''
 layout(location=0) in vec3 position;layout(location=1) in vec3 normal;layout(location=2) in vec3 diffuse;
 uniform mat4 mvp;uniform mat4 sceneTransform;out vec3 n;out vec3 c;
 void main(){gl_Position=mvp*sceneTransform*vec4(position,1);n=mat3(sceneTransform)*normal;c=diffuse;}'''
-FRAGMENT='''#version 430 core
+FRAGMENT=GLSL+'''
 in vec3 n;in vec3 c;out vec4 color;
 void main(){vec3 normal=normalize(n);float light=.60+.35*max(0,dot(normal,normalize(vec3(-.4,.8,-.6))));color=vec4(c*light,1);}'''
 TEXTURE_VERTEX='''#version 430 core
@@ -38,7 +39,12 @@ layout(location=0) in vec3 corner;
 uniform mat4 mvp;uniform mat4 sceneTransform;out vec3 n;out vec2 uv;
 void main(){Vertex v=vertices[int(corner.x)];gl_Position=mvp*sceneTransform*v.position;
 n=mat3(sceneTransform)*v.normal.xyz;uv=corner.yz;}'''
-TEXTURE_FRAGMENT='''#version 430 core
+# Without storage buffers the per-corner position, normal and UV are gathered on the CPU.
+TEXTURE_VERTEX_CPU=GLSL+'''
+layout(location=0) in vec3 position;layout(location=1) in vec3 normal;layout(location=2) in vec2 texcoord;
+uniform mat4 mvp;uniform mat4 sceneTransform;out vec3 n;out vec2 uv;
+void main(){gl_Position=mvp*sceneTransform*vec4(position,1);n=mat3(sceneTransform)*normal;uv=texcoord;}'''
+TEXTURE_FRAGMENT=GLSL+'''
 in vec3 n;in vec2 uv;out vec4 color;
 uniform sampler2D baseTexture;uniform bool hasTexture;uniform vec4 baseColor;
 void main(){vec4 c=hasTexture?texture(baseTexture,uv):baseColor;
@@ -49,20 +55,27 @@ color=vec4(c.rgb*light,1);}'''
 class CharacterRenderer(MeshRenderer):
     def __init__(self):
         super().__init__()
-        self.skin.removeAllShaders();self.surface.removeAllShaders()
-        self.skin=self.program(((QOpenGLShader.Compute,SKIN),))
+        self.surface.removeAllShaders()
+        if COMPUTE:
+            self.skin.removeAllShaders()
+            self.skin=self.program(((QOpenGLShader.Compute,SKIN),))
         self.surface=self.program(((QOpenGLShader.Vertex,VERTEX),(QOpenGLShader.Fragment,FRAGMENT)))
-        self.textured=self.program(((QOpenGLShader.Vertex,TEXTURE_VERTEX),(QOpenGLShader.Fragment,TEXTURE_FRAGMENT)))
+        self.textured=self.program(((QOpenGLShader.Vertex,TEXTURE_VERTEX if COMPUTE else TEXTURE_VERTEX_CPU),(QOpenGLShader.Fragment,TEXTURE_FRAGMENT)))
         self.textures={};self.batches=[]
 
     def load(self,asset,palette):
         if self.asset_key==asset['key']:return
         self.release_buffers();self.vertex_count=len(asset['vertices']);self.index_count=asset['faces'].size
         self.vao.bind()
-        self.model=self.buffer(np.concatenate([asset['vertices'].ravel(),asset['rows'].ravel(),asset['weights'].ravel()]).astype('float32'))
         self.vertices=self.buffer(self.vertex_count*32)
-        self.offsets=self.buffer(asset['offsets']);self.neighbors=self.buffer(asset['neighbors'])
-        self.frame=self.buffer(palette*16*4)
+        if COMPUTE:
+            self.model=self.buffer(np.concatenate([asset['vertices'].ravel(),asset['rows'].ravel(),asset['weights'].ravel()]).astype('float32'))
+            self.offsets=self.buffer(asset['offsets']);self.neighbors=self.buffer(asset['neighbors'])
+            self.frame=self.buffer(palette*16*4)
+        else:
+            self.model=self.offsets=self.neighbors=self.frame=None
+            packed=np.concatenate([asset['vertices'].ravel(),asset['rows'].ravel(),asset['weights'].ravel()]).astype('float32')
+            self.cpu=dict(model=CharacterModel(packed,self.vertex_count),topology=Topology(asset['offsets'],asset['neighbors']))
         self.indices=self.buffer(asset['faces'],QOpenGLBuffer.IndexBuffer);self.indices.bind()
         self.surface.bind();self.vertices.bind()
         for i,offset in [(0,0),(1,16)]:
@@ -74,8 +87,15 @@ class CharacterRenderer(MeshRenderer):
             if asset.get('textures'):
                 data=asset['textures']
                 self.vao.bind();self.textured.bind()
-                self.corners=self.buffer(data['corners'])
-                self.textured.enableAttributeArray(0);self.textured.setAttributeBuffer(0,0x1406,0,3,12)
+                if COMPUTE:
+                    self.corners=self.buffer(data['corners'])
+                    self.textured.enableAttributeArray(0);self.textured.setAttributeBuffer(0,0x1406,0,3,12)
+                else:
+                    corners=np.asarray(data['corners'],np.float32).reshape(-1,3)
+                    self.corner_vertex=corners[:,0].astype(np.int64);self.corner_uv=corners[:,1:3]
+                    self.corners=self.buffer(len(corners)*32)
+                    for i,(offset,size) in enumerate(((0,3),(12,3),(24,2))):
+                        self.textured.enableAttributeArray(i);self.textured.setAttributeBuffer(i,0x1406,offset,size,32)
                 self.vao.release();self.textured.release()
                 for name,pixels in data['images'].items():
                     h,w=pixels.shape[:2]
@@ -96,6 +116,15 @@ class CharacterRenderer(MeshRenderer):
         self.asset_key=asset['key'];self.frame_key=None
         self.check('character load')
 
+    def skin_cpu(self,palette):
+        pos=self.cpu['model'].skin(palette)
+        data=records(pos,self.cpu['topology'].normals(pos))
+        if self.batches:
+            corner=np.empty((len(self.corner_vertex),8),np.float32)
+            corner[:,0:3]=data[self.corner_vertex,0:3];corner[:,3:6]=data[self.corner_vertex,4:7];corner[:,6:8]=self.corner_uv
+            self.corners.bind();self.corners.write(0,corner.tobytes(),corner.nbytes)
+        return data
+
     def draw(self,eye,basis,width,height,color=(.71,.71,.71),transform=None,clear_depth=True):
         if not self.batches:
             return super().draw(eye,basis,width,height,color,transform,clear_depth)
@@ -105,7 +134,7 @@ class CharacterRenderer(MeshRenderer):
         shader.setUniformValue('mvp',projection*QMatrix4x4(*view.ravel().tolist()))
         shader.setUniformValue('sceneTransform',QMatrix4x4(*np.asarray(transform if transform is not None else np.eye(4)).ravel().tolist()))
         gl.glUniform1i(shader.uniformLocation('baseTexture'),0)
-        gl.glBindBufferBase(0x90D2,1,self.vertices.bufferId())
+        if COMPUTE:gl.glBindBufferBase(0x90D2,1,self.vertices.bufferId())
         gl.glEnable(0x0B71);gl.glDepthMask(True);gl.glDepthFunc(0x0201)
         for flag in (0x0B90,0x0C11,0x0B44,0x0BE2):gl.glDisable(flag)
         if clear_depth:gl.glClear(0x100)

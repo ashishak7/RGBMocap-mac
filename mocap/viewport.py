@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -29,7 +30,7 @@ class MotionView(ViewportBase):
         super().__init__()
         if OPENGL_VIEW:
             fmt = QSurfaceFormat()
-            fmt.setVersion(4,3)
+            fmt.setVersion(*((4,1) if sys.platform=='darwin' else (4,3)))
             fmt.setProfile(QSurfaceFormat.CoreProfile)
             fmt.setDepthBufferSize(24)
             fmt.setStencilBufferSize(8)

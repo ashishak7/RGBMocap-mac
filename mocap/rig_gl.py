@@ -3,7 +3,8 @@ import numpy as np
 from shiboken6 import VoidPtr
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtOpenGL import QOpenGLBuffer,QOpenGLShader
-from .mesh_gl import MeshRenderer
+from .mesh_gl import MeshRenderer, COMPUTE
+from .cpu_skin import RigModel, Topology, records
 
 SKIN='''#version 430 core
 layout(local_size_x=64) in;
@@ -31,7 +32,7 @@ class RigRenderer(MeshRenderer):
     def __init__(self,shared=None):
         super().__init__(shared)
         self.topology_key=None
-        if shared is None:
+        if shared is None and COMPUTE:
             self.skin.removeAllShaders()
             self.skin=self.program(((QOpenGLShader.Compute,SKIN),))
 
@@ -45,11 +46,17 @@ class RigRenderer(MeshRenderer):
         self.release_buffers();self.vertex_count=int(asset['vertex_count']);self.index_count=asset['faces'].size
         self.raw=asset['mode']=='raw';self.bone_count=asset.get('bone_count',52);self.vao.bind()
         if self.shared and self.shared.topology_key!=topology:raise ValueError('Shared raw meshes must have identical topology')
-        self.model=self.shared.model if self.shared else self.buffer(asset.get('packed',np.zeros(7,np.float32)))
         self.vertices=self.buffer(self.vertex_count*32)
-        self.offsets=self.shared.offsets if self.shared else self.buffer(asset.get('offsets',np.zeros(1,np.uint32)))
-        self.neighbors=self.shared.neighbors if self.shared else self.buffer(asset.get('neighbors',np.zeros(1,np.uint32)))
-        self.frame=self.buffer((self.vertex_count*3 if self.raw else self.bone_count*16)*4)
+        if COMPUTE:
+            self.model=self.shared.model if self.shared else self.buffer(asset.get('packed',np.zeros(7,np.float32)))
+            self.offsets=self.shared.offsets if self.shared else self.buffer(asset.get('offsets',np.zeros(1,np.uint32)))
+            self.neighbors=self.shared.neighbors if self.shared else self.buffer(asset.get('neighbors',np.zeros(1,np.uint32)))
+            self.frame=self.buffer((self.vertex_count*3 if self.raw else self.bone_count*16)*4)
+        else:
+            self.model=self.offsets=self.neighbors=self.frame=None
+            self.cpu=self.shared.cpu if self.shared else dict(
+                model=None if self.raw else RigModel(asset['packed'],self.vertex_count),
+                topology=Topology(asset['offsets'],asset['neighbors']) if self.raw else None)
         self.indices=self.shared.indices if self.shared else self.buffer(asset['faces'],QOpenGLBuffer.IndexBuffer);self.indices.bind()
         self.surface.bind();self.vertices.bind()
         for i,offset in ((0,0),(1,16)):
@@ -62,6 +69,12 @@ class RigRenderer(MeshRenderer):
         frame=np.ascontiguousarray(frame,dtype=np.float32)
         expected=self.vertex_count*3 if self.raw else self.bone_count*16
         if frame.size!=expected or not np.isfinite(frame).all():raise ValueError('Invalid target render frame')
+        if not COMPUTE:
+            if self.raw:
+                pos=frame.reshape(-1,3);data=records(pos,self.cpu['topology'].normals(pos))
+            else:
+                pos,normal=self.cpu['model'].skin(frame);data=records(pos,normal)
+            self.upload_vertices(data);self.frame_key=key;self.dispatches+=1;return
         self.frame.bind();self.frame.write(0,frame.tobytes(),frame.nbytes)
         for index,buffer in enumerate((self.model,self.vertices,self.offsets,self.neighbors,self.frame)):
             self.gl.glBindBufferBase(0x90D2,index,buffer.bufferId())
