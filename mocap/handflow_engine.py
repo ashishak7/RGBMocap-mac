@@ -29,6 +29,7 @@ def infer(project,emit,n):
     from .models import BY_KEY
     from .compute_policy import retry_cuda
     if os.name=='nt':os.environ['PYOPENGL_PLATFORM']='win32'  # Elsewhere HaMeR's renderer defaults to EGL.
+    if sys.platform=='darwin':os.environ['PYOPENGL_PLATFORM']='darwin'  # macOS has no EGL.
     os.environ['WANDB_MODE']='disabled'
     os.environ['YOLO_CONFIG_DIR']=str(MODELS/'handflow/settings')
     # Only pinned/checksummed official weights enter this worker. Upstream
