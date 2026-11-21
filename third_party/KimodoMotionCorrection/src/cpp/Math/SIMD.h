@@ -6,7 +6,19 @@
 #pragma once
 
 #include <stdint.h>
+#if defined( __aarch64__ ) || defined( __arm64__ ) || defined( _M_ARM64 )
+#include "../compat/sse2neon.h"
+
+// AVX variable permute, absent from sse2neon: pick lanes by the low two bits of each index.
+static inline __m128 _mm_permutevar_ps( __m128 a, __m128i control )
+{
+    uint32x4_t lane = vandq_u32( vreinterpretq_u32_m128i( control ), vdupq_n_u32( 3 ) );
+    uint32x4_t bytes = vaddq_u32( vmulq_n_u32( lane, 0x04040404u ), vdupq_n_u32( 0x03020100u ) );
+    return vreinterpretq_m128_u8( vqtbl1q_u8( vreinterpretq_u8_m128( a ), vreinterpretq_u8_u32( bytes ) ) );
+}
+#else
 #include <immintrin.h>
+#endif
 
 namespace SIMD
 {

@@ -1,6 +1,7 @@
 """Worker resource budgets. GUI imports stay free of Torch and CUDA."""
 from __future__ import annotations
 import os
+import sys
 GIB=1024**3
 MODES=('auto','low_memory')
 
@@ -111,6 +112,13 @@ def retry_cuda(operation,batch,on_retry,oom_type=None,cleanup=None):
     if oom_type is None:
         import torch
         oom_type=torch.cuda.OutOfMemoryError
+        if sys.platform=='darwin':
+            raw=operation
+            def operation(batch):
+                try:return raw(batch)
+                except RuntimeError as exc:
+                    if 'out of memory' in str(exc).lower():raise oom_type(str(exc)) from None
+                    raise
     while True:
         failed=False
         try:

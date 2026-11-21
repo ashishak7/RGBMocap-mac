@@ -1,0 +1,134 @@
+"""Run CUDA-only worker code on Apple's MPS backend.
+
+Models are written against `cuda` devices and `torch.cuda.*` queries. On macOS this
+module redirects those calls to MPS (with CPU fallback for unsupported operators)
+instead of editing every vendored model. Import `install()` before any model code.
+"""
+import os
+import sys
+from types import SimpleNamespace
+
+
+def available():
+    return sys.platform == 'darwin'
+
+
+def _is_cuda(value):
+    return (isinstance(value, str) and value.startswith('cuda')) or \
+        (hasattr(value, 'type') and getattr(value, 'type', None) == 'cuda')
+
+
+def install():
+    if not available():
+        return False
+    os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+    import torch
+    if not torch.backends.mps.is_available() or getattr(torch, '_rgbmocap_mps', False):
+        return False
+    torch._rgbmocap_mps = True
+    mps = torch.device('mps')
+
+    def fix(value):
+        return mps if _is_cuda(value) else value
+
+    def fix_dtype(value, device):
+        return torch.float32 if value is torch.float64 and device is not None and str(device).startswith('mps') else value
+
+    # --- torch.cuda queries -------------------------------------------------
+    total = int(torch.mps.recommended_max_memory())
+
+    def mem_get_info(device=None):
+        return max(0, total - int(torch.mps.current_allocated_memory())), total
+
+    chip = 'Apple GPU'
+    try:
+        import subprocess
+        chip = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], capture_output=True, text=True).stdout.strip() or chip
+    except OSError:
+        pass
+    cuda = torch.cuda
+    cuda.is_available = lambda: True
+    cuda.is_initialized = lambda: True
+    cuda.device_count = lambda: 1
+    cuda.current_device = lambda: 0
+    cuda.set_device = lambda device: None
+    cuda.mem_get_info = mem_get_info
+    cuda.empty_cache = torch.mps.empty_cache
+    cuda.synchronize = lambda device=None: torch.mps.synchronize()
+    cuda.reset_peak_memory_stats = lambda device=None: None
+    cuda.set_per_process_memory_fraction = lambda fraction, device=None: None
+    cuda.max_memory_allocated = lambda device=None: int(torch.mps.current_allocated_memory())
+    cuda.max_memory_reserved = lambda device=None: int(torch.mps.driver_allocated_memory())
+    cuda.memory_allocated = lambda device=None: int(torch.mps.current_allocated_memory())
+    cuda.memory_reserved = lambda device=None: int(torch.mps.driver_allocated_memory())
+    cuda.get_device_name = lambda device=None: chip
+    cuda.get_device_capability = lambda device=None: (0, 0)
+    cuda.get_device_properties = lambda device=None: SimpleNamespace(name=chip, total_memory=total, major=0, minor=0)
+    cuda.manual_seed = cuda.manual_seed_all = lambda seed: torch.mps.manual_seed(seed)
+
+    # --- explicit device arguments ------------------------------------------
+    from torch.overrides import TorchFunctionMode
+
+    class Redirect(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = dict(kwargs or {})
+            if func is torch.Tensor.cuda:
+                func, args = torch.Tensor.to, (args[0], mps)
+            if _is_cuda(kwargs.get('device')):
+                kwargs['device'] = mps
+            if func is torch.Tensor.to:
+                args = tuple(fix(a) for a in args)
+                target = kwargs.get('device', next((a for a in args[1:] if isinstance(a, (str, torch.device))), None))
+                if target is not None and str(target).startswith('mps'):
+                    args = tuple(fix_dtype(a, target) for a in args)
+                    kwargs = {k: fix_dtype(v, target) if k == 'dtype' else v for k, v in kwargs.items()}
+                    if args[0].dtype is torch.float64 and not any(isinstance(a, torch.dtype) for a in args[1:]) and 'dtype' not in kwargs:
+                        args = (args[0].float(),) + args[1:]
+            elif kwargs.get('device') is not None and str(kwargs['device']).startswith('mps'):
+                kwargs['dtype'] = fix_dtype(kwargs.get('dtype'), kwargs['device'])
+                if kwargs['dtype'] is None:
+                    del kwargs['dtype']
+            return func(*args, **kwargs)
+
+    Redirect().__enter__()
+
+    # --- modules, checkpoints, mixed precision ------------------------------
+    Module = torch.nn.Module
+    original_to = Module.to
+
+    def module_to(self, *args, **kwargs):
+        args = tuple(fix(a) for a in args)
+        if _is_cuda(kwargs.get('device')):
+            kwargs['device'] = mps
+        target = kwargs.get('device', next((a for a in args if isinstance(a, (str, torch.device))), None))
+        if target is not None and str(target).startswith('mps'):
+            if any(p.dtype is torch.float64 for p in self.parameters()):
+                self.float()
+            args = tuple(fix_dtype(a, target) for a in args)
+            if 'dtype' in kwargs:
+                kwargs['dtype'] = fix_dtype(kwargs['dtype'], target)
+        return original_to(self, *args, **kwargs)
+
+    Module.to = module_to
+    Module.cuda = lambda self, device=None: module_to(self, mps)
+
+    original_load = torch.load
+
+    def load(*args, **kwargs):
+        location = kwargs.get('map_location')
+        kwargs['map_location'] = 'cpu' if location is None or _is_cuda(location) else location
+        return original_load(*args, **kwargs)
+
+    torch.load = load
+
+    original_autocast = torch.autocast.__init__
+
+    def autocast_init(self, device_type='cuda', *args, **kwargs):
+        return original_autocast(self, 'mps' if device_type == 'cuda' else device_type, *args, **kwargs)
+
+    torch.autocast.__init__ = autocast_init
+    return True
+
+
+def is_oom(error):
+    return 'out of memory' in str(error).lower()
